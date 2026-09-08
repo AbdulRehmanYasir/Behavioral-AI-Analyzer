@@ -1,0 +1,142 @@
+@import "tailwindcss" source(none);
+@source "../src";
+@import "tw-animate-css";
+
+@custom-variant dark (&:is(.dark *));
+
+@theme inline {
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 4px);
+  --radius-2xl: calc(var(--radius) + 8px);
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-destructive-foreground: var(--destructive-foreground);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  --color-success: var(--success);
+  --color-warning: var(--warning);
+  --color-danger: var(--danger);
+  --color-info: var(--info);
+  --color-glass: var(--glass);
+  --color-glass-border: var(--glass-border);
+}
+
+:root {
+  --radius: 0.875rem;
+  --background: oklch(0.16 0.02 265);
+  --foreground: oklch(0.97 0.01 260);
+  --card: oklch(0.21 0.025 265);
+  --card-foreground: oklch(0.97 0.01 260);
+  --popover: oklch(0.21 0.025 265);
+  --popover-foreground: oklch(0.97 0.01 260);
+  --primary: oklch(0.72 0.18 190);
+  --primary-foreground: oklch(0.15 0.02 260);
+  --secondary: oklch(0.28 0.03 265);
+  --secondary-foreground: oklch(0.97 0.01 260);
+  --muted: oklch(0.26 0.02 265);
+  --muted-foreground: oklch(0.7 0.02 260);
+  --accent: oklch(0.68 0.22 310);
+  --accent-foreground: oklch(0.98 0 0);
+  --destructive: oklch(0.66 0.22 20);
+  --destructive-foreground: oklch(0.98 0 0);
+  --border: oklch(1 0 0 / 10%);
+  --input: oklch(1 0 0 / 12%);
+  --ring: oklch(0.72 0.18 190);
+  --success: oklch(0.75 0.17 155);
+  --warning: oklch(0.82 0.17 85);
+  --danger: oklch(0.66 0.22 20);
+  --info: oklch(0.72 0.18 240);
+  --glass: oklch(1 0 0 / 5%);
+  --glass-border: oklch(1 0 0 / 12%);
+}
+
+.light {
+  --background: oklch(0.99 0.002 260);
+  --foreground: oklch(0.12 0.01 260);
+
+  --card: oklch(1 0 0);
+  --card-foreground: oklch(0.20 0.02 265);
+
+  --popover: oklch(1 0 0);
+  --popover-foreground: oklch(0.20 0.02 265);
+
+  --primary: oklch(0.52 0.22 255);
+  --primary-foreground: oklch(1 0 0);
+
+  --secondary: oklch(0.96 0.005 260);
+  --secondary-foreground: oklch(0.20 0.02 265);
+
+  --muted: oklch(0.97 0.003 260);
+  --muted-foreground: oklch(0.50 0.02 260);
+
+  --accent: oklch(0.65 0.18 290);
+  --accent-foreground: oklch(1 0 0);
+
+  --destructive: oklch(0.62 0.22 20);
+
+  --border: oklch(0.82 0.005 260);
+  --input: oklch(0.90 0.005 260);
+
+  --ring: oklch(0.60 0.18 250);
+
+  --glass: oklch(1 0 0);
+--glass-border: oklch(0.88 0.005 260);
+}
+
+@layer base {
+  * { border-color: var(--color-border); }
+  html, body {
+    background-color: var(--color-background);
+    color: var(--color-foreground);
+    font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+ body {
+  background-image:
+    radial-gradient(1200px 600px at 10% -10%, oklch(0.72 0.18 190 / 0.14), transparent 60%),
+    radial-gradient(900px 500px at 110% 10%, oklch(0.68 0.22 310 / 0.12), transparent 60%),
+    radial-gradient(700px 500px at 50% 120%, oklch(0.72 0.18 240 / 0.08), transparent 60%);
+    background-attachment: fixed;
+    min-height: 100vh;
+  }
+}
+
+@utility glass {
+  background: color-mix(in srgb, var(--color-card) 95%, white 5%);
+  backdrop-filter: blur(12px);
+  border: 1px solid rgba(0,0,0,0.08);
+  box-shadow: 0 6px 18px rgba(0,0,0,0.06);
+}
+
+@utility glass-strong {
+  background: var(--color-card);
+  backdrop-filter: blur(12px);
+  border: 1px solid rgba(0,0,0,0.08);
+}
+
+@utility gradient-text {
+  background: linear-gradient(135deg, var(--color-primary), var(--color-accent));
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}
+
+html.light body {
+  background: var(--color-background) !important;
+  background-image: none !important;
+}
