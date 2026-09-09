@@ -24,12 +24,22 @@ export const Route = createFileRoute("/")({
 const STORAGE_KEY = "behavioral-ai-analyzer-sessions-v1";
 const THEME_KEY = "behavioral-ai-analyzer-theme";
 
+/*
+ * Safety limits:
+ * Prevent browser auto-repeat and extremely long sessions from
+ * creating an unbounded React state array.
+ */
+const MAX_EVENTS = 2000;
+const ANALYSIS_DEBOUNCE_MS = 180;
+
 function isSessionSnapshot(value: unknown): value is SessionSnapshot {
   if (!value || typeof value !== "object") return false;
+
   const snapshot = value as Partial<SessionSnapshot>;
   const stats = snapshot.stats as Partial<SessionSnapshot["stats"]> | undefined;
   const scores = snapshot.scores as Partial<SessionSnapshot["scores"]> | undefined;
   const content = snapshot.content as Partial<SessionSnapshot["content"]> | undefined;
+
   const finiteStats = stats
     ? [
         stats.totalChars,
@@ -54,6 +64,7 @@ function isSessionSnapshot(value: unknown): value is SessionSnapshot {
         stats.keystrokeIntervalMs,
       ].every((item) => typeof item === "number" && Number.isFinite(item))
     : false;
+
   const finiteScores = scores
     ? [
         scores.human,
@@ -63,9 +74,14 @@ function isSessionSnapshot(value: unknown): value is SessionSnapshot {
         scores.suspicious,
         scores.confidence,
       ].every(
-        (item) => typeof item === "number" && Number.isFinite(item) && item >= 0 && item <= 100,
+        (item) =>
+          typeof item === "number" &&
+          Number.isFinite(item) &&
+          item >= 0 &&
+          item <= 100,
       ) && typeof scores.verdict === "string"
     : false;
+
   const finiteContent = content
     ? [
         content.grammarConsistency,
@@ -80,49 +96,78 @@ function isSessionSnapshot(value: unknown): value is SessionSnapshot {
       ].every((item) => typeof item === "number" && Number.isFinite(item)) &&
       Array.isArray(content.aiPhraseHits)
     : false;
+
   return Boolean(
     typeof snapshot.id === "string" &&
-    typeof snapshot.createdAt === "number" &&
-    typeof snapshot.textPreview === "string" &&
-    finiteStats &&
-    finiteContent &&
-    finiteScores &&
-    Array.isArray(snapshot.timeline) &&
-    Array.isArray(snapshot.explanations),
+      typeof snapshot.createdAt === "number" &&
+      typeof snapshot.textPreview === "string" &&
+      finiteStats &&
+      finiteContent &&
+      finiteScores &&
+      Array.isArray(snapshot.timeline) &&
+      Array.isArray(snapshot.explanations),
   );
 }
 
 function DetectorPage() {
   const [text, setText] = useState("");
+  const [analysisText, setAnalysisText] = useState("");
+
   const [events, setEvents] = useState<BehaviorEvent[]>([]);
   const [sessionStart, setSessionStart] = useState<number | null>(null);
   const [nowTick, setNowTick] = useState(0);
+
   const [analyzed, setAnalyzed] = useState(false);
-  const [analysisSnapshot, setAnalysisSnapshot] = useState<SessionSnapshot | null>(null);
+  const [analysisSnapshot, setAnalysisSnapshot] =
+    useState<SessionSnapshot | null>(null);
+
   const [history, setHistory] = useState<SessionSnapshot[]>([]);
   const [compareId, setCompareId] = useState<string | null>(null);
+
   const [theme, setTheme] = useState<"dark" | "light">("dark");
   const themeReady = useRef(false);
+
   const [dragging, setDragging] = useState(false);
+  const [copied, setCopied] = useState(false);
+
   const taRef = useRef<HTMLTextAreaElement>(null);
+
+  /*
+   * Debounce expensive content analysis.
+   *
+   * `text` remains immediate so the textarea always feels responsive.
+   * `analysisText` only changes after the user pauses briefly.
+   */
+  useEffect(() => {
+    const timer = window.setTimeout(() => {
+      setAnalysisText(text);
+    }, ANALYSIS_DEBOUNCE_MS);
+
+    return () => window.clearTimeout(timer);
+  }, [text]);
 
   useEffect(() => {
     try {
       const savedTheme = localStorage.getItem(THEME_KEY);
-      if (savedTheme === "light" || savedTheme === "dark") setTheme(savedTheme);
+
+      if (savedTheme === "light" || savedTheme === "dark") {
+        setTheme(savedTheme);
+      }
     } catch {
-      // Use the default theme when storage is unavailable.
+      // Use default theme when storage is unavailable.
     }
+
     themeReady.current = true;
   }, []);
 
   useEffect(() => {
     document.documentElement.classList.toggle("light", theme === "light");
+
     if (themeReady.current) {
       try {
         localStorage.setItem(THEME_KEY, theme);
       } catch {
-        // Theme still applies for the current session when storage is unavailable.
+        // Theme still applies for the current session.
       }
     }
   }, [theme]);
@@ -131,134 +176,302 @@ function DetectorPage() {
   useEffect(() => {
     try {
       const raw = localStorage.getItem(STORAGE_KEY);
+
       if (raw) {
         const parsed: unknown = JSON.parse(raw);
+
         if (Array.isArray(parsed)) {
           setHistory(parsed.filter(isSessionSnapshot).slice(0, 20));
         }
       }
     } catch {
-      /* ignore */
+      // Ignore malformed/unavailable storage.
     }
   }, []);
 
-  // Live clock while a session is active (for the running stats)
+  // Live clock while a session is active
   useEffect(() => {
     if (!sessionStart) return;
-    const id = window.setInterval(() => setNowTick((n) => n + 1), 500);
+
+    const id = window.setInterval(() => {
+      setNowTick((n) => n + 1);
+    }, 500);
+
     return () => window.clearInterval(id);
   }, [sessionStart]);
 
   const now = useMemo(
     () => (sessionStart ? Date.now() - sessionStart : 0),
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    [sessionStart, nowTick, events.length, text],
+    [sessionStart, nowTick],
   );
 
   const ensureSession = useCallback(() => {
     if (sessionStart) return sessionStart;
+
     const t = Date.now();
+
     setSessionStart(t);
     setEvents([{ t: 0, type: "start" }]);
+
     return t;
   }, [sessionStart]);
 
+  /*
+   * Centralized event recorder.
+   *
+   * The event array is deliberately bounded. This protects the app from
+   * browser auto-repeat, very long sessions, and accidental event storms.
+   */
   const push = useCallback(
     (type: BehaviorEvent["type"], meta?: BehaviorEvent["meta"]) => {
       const start = ensureSession();
+
       setAnalyzed(false);
       setAnalysisSnapshot(null);
-      setEvents((ev) => [...ev, { t: Date.now() - start, type, meta }]);
+
+      setEvents((ev) => {
+        const nextEvent: BehaviorEvent = {
+          t: Date.now() - start,
+          type,
+          meta,
+        };
+
+        const next = [...ev, nextEvent];
+
+        if (next.length <= MAX_EVENTS) {
+          return next;
+        }
+
+        return next.slice(next.length - MAX_EVENTS);
+      });
     },
     [ensureSession],
   );
 
   // Handlers
   const onKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
-    if (e.key === "Backspace") push("backspace");
-    else if (e.key === "Delete") push("delete");
-    else if (e.key.length === 1) push("keydown", { key: e.key });
-    else if (e.key.startsWith("Arrow")) push("cursor");
+    /*
+     * Critical crash fix:
+     *
+     * Holding Backspace/Delete causes the browser to fire repeated
+     * keydown events. Previously every repeated event was appended to
+     * React state, causing thousands of renders and expensive analysis.
+     *
+     * Ignore browser auto-repeat for deletion events. The textarea itself
+     * continues to perform the deletion normally.
+     */
+    if ((e.key === "Backspace" || e.key === "Delete") && e.repeat) {
+      return;
+    }
+
+    if (e.key === "Backspace") {
+      push("backspace");
+    } else if (e.key === "Delete") {
+      push("delete");
+    } else if (e.key.length === 1) {
+      /*
+       * Ignore repeated printable-key events as well.
+       * This prevents holding a key from filling the event buffer.
+       */
+      if (!e.repeat) {
+        push("keydown", { key: e.key });
+      }
+    } else if (e.key.startsWith("Arrow")) {
+      /*
+       * Cursor events can also repeat heavily when an arrow key is held.
+       * Only record the initial press.
+       */
+      if (!e.repeat) {
+        push("cursor");
+      }
+    }
   };
+
   const onPaste = (e: React.ClipboardEvent<HTMLTextAreaElement>) => {
     const size = e.clipboardData.getData("text").length;
     push("paste", { size });
   };
-  const onCopy = () => push("copy");
-  const onCut = () => push("cut");
+
+  const onCopy = () => {
+    push("copy");
+  };
+
+  const onCut = () => {
+    push("cut");
+  };
+
   const onSelect = (e: React.SyntheticEvent<HTMLTextAreaElement>) => {
     const el = e.currentTarget;
-    if (el.selectionStart !== el.selectionEnd) push("selection");
+
+    if (el.selectionStart !== el.selectionEnd) {
+      push("selection");
+    }
   };
-  const onClick = () => push("cursor");
+
+  const onClick = () => {
+    push("cursor");
+  };
 
   // Drag & drop text file
   const onDrop = async (e: React.DragEvent<HTMLDivElement>) => {
     e.preventDefault();
     setDragging(false);
+
     const file = e.dataTransfer.files[0];
+
     if (!file) return;
-    const content = await file.text();
-    push("drop", { size: content.length, name: file.name });
+
+    const droppedContent = await file.text();
+
+    push("drop", {
+      size: droppedContent.length,
+      name: file.name,
+    });
+
     setAnalyzed(false);
     setAnalysisSnapshot(null);
-    setText((t) => t + content);
+
+    setText((current) => current + droppedContent);
   };
 
   const reset = () => {
     setText("");
+    setAnalysisText("");
+
     setEvents([]);
     setSessionStart(null);
     setAnalyzed(false);
     setAnalysisSnapshot(null);
+
     setCompareId(null);
     setNowTick(0);
+    setCopied(false);
   };
 
-  const stats = useMemo(() => computeStats(events, text, now), [events, text, now]);
-  const content = useMemo(() => analyzeContent(text), [text]);
-  const scores = useMemo(() => computeScores(stats, content), [stats, content]);
-  const timeline = useMemo(() => buildTimeline(events), [events]);
+  /*
+   * Expensive live calculations use the debounced text.
+   *
+   * This prevents analyzeContent() from running on every single
+   * keystroke while the user is actively typing or deleting.
+   */
+  const stats = useMemo(
+    () => computeStats(events, analysisText, now),
+    [events, analysisText, now],
+  );
+
+  const content = useMemo(
+    () => analyzeContent(analysisText),
+    [analysisText],
+  );
+
+  const scores = useMemo(
+    () => computeScores(stats, content),
+    [stats, content],
+  );
+
+  const timeline = useMemo(
+    () => buildTimeline(events),
+    [events],
+  );
+
   const explanations = useMemo(
     () => buildExplanations(stats, content, scores),
     [stats, content, scores],
   );
 
+  /*
+   * Analyze button always analyzes the CURRENT textarea value directly.
+   * It does not wait for the debounce timer.
+   */
   const runAnalysis = () => {
     if (!text.trim()) return;
+
     const start = sessionStart ?? Date.now();
-    const analysisEvents = sessionStart
-      ? [...events, { t: Date.now() - start, type: "submit" as const }]
+
+    const analysisEvents: BehaviorEvent[] = sessionStart
+      ? [
+          ...events,
+          {
+            t: Date.now() - start,
+            type: "submit" as const,
+          },
+        ].slice(-MAX_EVENTS)
       : [
-          { t: 0, type: "start" as const },
-          { t: Date.now() - start, type: "submit" as const },
+          {
+            t: 0,
+            type: "start" as const,
+          },
+          {
+            t: Date.now() - start,
+            type: "submit" as const,
+          },
         ];
+
     const analysisNow = Date.now() - start;
-    const analysisStats = computeStats(analysisEvents, text, analysisNow);
+
+    const analysisStats = computeStats(
+      analysisEvents,
+      text,
+      analysisNow,
+    );
+
     const analysisContent = analyzeContent(text);
-    const analysisScores = computeScores(analysisStats, analysisContent);
+
+    const analysisScores = computeScores(
+      analysisStats,
+      analysisContent,
+    );
+
     const analysisTimeline = buildTimeline(analysisEvents);
-    const analysisExplanations = buildExplanations(analysisStats, analysisContent, analysisScores);
+
+    const analysisExplanations = buildExplanations(
+      analysisStats,
+      analysisContent,
+      analysisScores,
+    );
+
     const snap: SessionSnapshot = {
-      id: globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random()}`,
+      id:
+        globalThis.crypto?.randomUUID?.() ??
+        `${Date.now()}-${Math.random()}`,
+
       createdAt: Date.now(),
+
       textPreview: text.slice(0, 140),
+
       stats: analysisStats,
+
       content: analysisContent,
+
       scores: analysisScores,
+
       timeline: analysisTimeline,
+
       explanations: analysisExplanations,
     };
+
+    setText(text);
+    setAnalysisText(text);
+
     setEvents(analysisEvents);
+
     setSessionStart(sessionStart ?? start);
+
     setAnalysisSnapshot(snap);
+
     setAnalyzed(true);
+
     const next = [snap, ...history].slice(0, 20);
+
     setHistory(next);
+
     try {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(next));
+      localStorage.setItem(
+        STORAGE_KEY,
+        JSON.stringify(next),
+      );
     } catch {
-      /* ignore */
+      // Ignore storage failures.
     }
   };
 
@@ -269,92 +482,277 @@ function DetectorPage() {
     timeline,
     explanations,
   };
+
   const hasInput = text.trim().length > 0;
+
+  const wordCount = text.trim()
+    ? text.trim().split(/\s+/).length
+    : 0;
+
+  const characterCount = text.length;
 
   const clearHistory = () => {
     setHistory([]);
+
     try {
       localStorage.removeItem(STORAGE_KEY);
     } catch {
-      // Clearing in-memory history still succeeds when storage is unavailable.
+      // In-memory history still clears.
     }
+
     setCompareId(null);
+  };
+
+  const copySummary = async () => {
+    if (!analyzed) return;
+
+    const summary = [
+      "Behavioral AI Analyzer",
+      "",
+      `Verdict: ${displayed.scores.verdict}`,
+      `Human score: ${displayed.scores.human}%`,
+      `AI score: ${displayed.scores.ai}%`,
+      `Paste score: ${displayed.scores.paste}%`,
+      `Editing score: ${displayed.scores.editing}%`,
+      `Suspicious behavior: ${displayed.scores.suspicious}%`,
+      `Confidence: ${displayed.scores.confidence}%`,
+      "",
+      `Words: ${displayed.stats.totalWords}`,
+      `Characters: ${displayed.stats.totalChars}`,
+      `Average WPM: ${displayed.stats.avgWpm.toFixed(1)}`,
+      `Peak WPM: ${displayed.stats.peakWpm.toFixed(0)}`,
+      `Keystrokes: ${displayed.stats.keystrokes}`,
+      `Backspaces: ${displayed.stats.backspaces}`,
+      `Deletes: ${displayed.stats.deletes}`,
+      `Pastes: ${displayed.stats.pastes}`,
+      `Paste characters: ${displayed.stats.pasteChars}`,
+      "",
+      "Heuristic detector — signal, not certainty.",
+    ].join("\n");
+
+    try {
+      await navigator.clipboard.writeText(summary);
+
+      setCopied(true);
+
+      window.setTimeout(() => {
+        setCopied(false);
+      }, 1600);
+    } catch {
+      setCopied(false);
+    }
   };
 
   const exportJson = () => {
     const payload = displayed;
-    const blob = new Blob([JSON.stringify(payload, null, 2)], {
-      type: "application/json",
-    });
+
+    const blob = new Blob(
+      [JSON.stringify(payload, null, 2)],
+      {
+        type: "application/json",
+      },
+    );
+
     const url = URL.createObjectURL(blob);
+
     const a = document.createElement("a");
+
     a.href = url;
+
     a.download = `behavioral-ai-analyzer-report-${Date.now()}.json`;
+
     a.click();
+
     URL.revokeObjectURL(url);
   };
 
   const exportPdf = () => {
-    const doc = new jsPDF({ unit: "pt", format: "a4" });
+    const doc = new jsPDF({
+      unit: "pt",
+      format: "a4",
+    });
+
     const margin = 40;
+
     let y = margin;
+
     doc.setFontSize(18);
-    doc.text("Behavioral AI Analyzer — Analysis Report", margin, y);
+
+    doc.text(
+      "Behavioral AI Analyzer — Analysis Report",
+      margin,
+      y,
+    );
+
     y += 24;
+
     doc.setFontSize(11);
+
     doc.setTextColor(120);
-    doc.text(new Date().toLocaleString(), margin, y);
+
+    doc.text(
+      new Date().toLocaleString(),
+      margin,
+      y,
+    );
+
     y += 20;
+
     doc.setTextColor(0);
+
     doc.setFontSize(13);
-    doc.text(`Verdict: ${displayed.scores.verdict}`, margin, y);
+
+    doc.text(
+      `Verdict: ${displayed.scores.verdict}`,
+      margin,
+      y,
+    );
+
     y += 18;
+
     const rows: Array<[string, string]> = [
-      ["Human score", `${displayed.scores.human}%`],
-      ["AI score", `${displayed.scores.ai}%`],
-      ["Paste score", `${displayed.scores.paste}%`],
-      ["Editing score", `${displayed.scores.editing}%`],
-      ["Suspicious behavior", `${displayed.scores.suspicious}%`],
-      ["Confidence", `${displayed.scores.confidence}%`],
-      ["Words", `${displayed.stats.totalWords}`],
-      ["Avg WPM", displayed.stats.avgWpm.toFixed(1)],
-      ["Peak WPM", displayed.stats.peakWpm.toFixed(0)],
-      ["Keystrokes", `${displayed.stats.keystrokes}`],
-      ["Backspaces / Deletes", `${displayed.stats.backspaces} / ${displayed.stats.deletes}`],
-      ["Pastes (chars)", `${displayed.stats.pastes} (${displayed.stats.pasteChars})`],
-      ["Session (s)", (displayed.stats.sessionMs / 1000).toFixed(1)],
+      [
+        "Human score",
+        `${displayed.scores.human}%`,
+      ],
+      [
+        "AI score",
+        `${displayed.scores.ai}%`,
+      ],
+      [
+        "Paste score",
+        `${displayed.scores.paste}%`,
+      ],
+      [
+        "Editing score",
+        `${displayed.scores.editing}%`,
+      ],
+      [
+        "Suspicious behavior",
+        `${displayed.scores.suspicious}%`,
+      ],
+      [
+        "Confidence",
+        `${displayed.scores.confidence}%`,
+      ],
+      [
+        "Words",
+        `${displayed.stats.totalWords}`,
+      ],
+      [
+        "Characters",
+        `${displayed.stats.totalChars}`,
+      ],
+      [
+        "Avg WPM",
+        displayed.stats.avgWpm.toFixed(1),
+      ],
+      [
+        "Peak WPM",
+        displayed.stats.peakWpm.toFixed(0),
+      ],
+      [
+        "Keystrokes",
+        `${displayed.stats.keystrokes}`,
+      ],
+      [
+        "Backspaces / Deletes",
+        `${displayed.stats.backspaces} / ${displayed.stats.deletes}`,
+      ],
+      [
+        "Pastes (chars)",
+        `${displayed.stats.pastes} (${displayed.stats.pasteChars})`,
+      ],
+      [
+        "Session (s)",
+        (displayed.stats.sessionMs / 1000).toFixed(1),
+      ],
     ];
+
     doc.setFontSize(11);
+
     rows.forEach(([k, v]) => {
       doc.text(`${k}:`, margin, y);
+
       doc.text(v, margin + 180, y);
+
       y += 14;
     });
+
     y += 8;
+
     doc.setFontSize(13);
-    doc.text("Explanations", margin, y);
+
+    doc.text(
+      "Explanations",
+      margin,
+      y,
+    );
+
     y += 16;
+
     doc.setFontSize(10);
+
     displayed.explanations.forEach((e) => {
       if (y > 780) {
         doc.addPage();
+
         y = margin;
       }
-      doc.setFont("helvetica", "bold");
-      doc.text(`• ${e.label} (${e.risk})`, margin, y);
+
+      doc.setFont(
+        "helvetica",
+        "bold",
+      );
+
+      doc.text(
+        `• ${e.label} (${e.risk})`,
+        margin,
+        y,
+      );
+
       y += 12;
-      doc.setFont("helvetica", "normal");
-      const reason = doc.splitTextToSize(e.reason, 515);
-      doc.text(reason, margin + 10, y);
+
+      doc.setFont(
+        "helvetica",
+        "normal",
+      );
+
+      const reason = doc.splitTextToSize(
+        e.reason,
+        515,
+      );
+
+      doc.text(
+        reason,
+        margin + 10,
+        y,
+      );
+
       y += reason.length * 12;
-      const ev = doc.splitTextToSize(`Evidence: ${e.evidence}`, 515);
-      doc.text(ev, margin + 10, y);
+
+      const ev = doc.splitTextToSize(
+        `Evidence: ${e.evidence}`,
+        515,
+      );
+
+      doc.text(
+        ev,
+        margin + 10,
+        y,
+      );
+
       y += ev.length * 12 + 4;
     });
-    doc.save(`behavioral-ai-analyzer-report-${Date.now()}.pdf`);
+
+    doc.save(
+      `behavioral-ai-analyzer-report-${Date.now()}.pdf`,
+    );
   };
 
-  const compareSession = compareId ? (history.find((h) => h.id === compareId) ?? null) : null;
+  const compareSession = compareId
+    ? history.find((h) => h.id === compareId) ?? null
+    : null;
 
   return (
     <div
@@ -370,25 +768,47 @@ function DetectorPage() {
       <header className="max-w-7xl mx-auto px-6 pt-8 pb-4 flex items-center justify-between">
         <div className="flex items-center gap-3">
           <div className="w-10 h-10 rounded-xl glass grid place-items-center text-lg">
-            <span className="gradient-text font-bold">◈</span>
+            <span className="gradient-text font-bold">
+              ◈
+            </span>
           </div>
+
           <div>
             <h1 className="text-lg font-semibold leading-tight">
               Behavioral AI&nbsp;
-              <span className={theme === "light" ? "text-primary" : "gradient-text"}>Analyzer</span>
+
+              <span
+                className={
+                  theme === "light"
+                    ? "text-primary"
+                    : "gradient-text"
+                }
+              >
+                Analyzer
+              </span>
             </h1>
+
             <p className="text-xs text-muted-foreground">
               Behavioral analysis of how text is written — not just what it says.
             </p>
           </div>
         </div>
+
         <div className="flex items-center gap-2">
           <button
-            onClick={() => setTheme(theme === "dark" ? "light" : "dark")}
+            onClick={() =>
+              setTheme(
+                theme === "dark"
+                  ? "light"
+                  : "dark",
+              )
+            }
             className="glass px-3 py-2 rounded-lg text-sm hover:bg-primary/10 transition"
             aria-label="Toggle theme"
           >
-            {theme === "dark" ? "☾ Dark" : "☀ Light"}
+            {theme === "dark"
+              ? "☾ Dark"
+              : "☀ Light"}
           </button>
         </div>
       </header>
@@ -401,20 +821,30 @@ function DetectorPage() {
               <h2 className="text-sm font-semibold uppercase tracking-wider text-muted-foreground">
                 Input
               </h2>
+
               <div className="text-xs text-muted-foreground tabular-nums">
-                {stats.totalWords} words · {(stats.sessionMs / 1000).toFixed(1)}s
+                {wordCount} words ·{" "}
+                {characterCount} chars ·{" "}
+                {(stats.sessionMs / 1000).toFixed(1)}s
               </div>
             </div>
+
             <div
-              className={`relative rounded-xl transition ${dragging ? "ring-2 ring-primary" : ""}`}
+              className={`relative rounded-xl transition ${
+                dragging
+                  ? "ring-2 ring-primary"
+                  : ""
+              }`}
             >
               <textarea
                 ref={taRef}
                 value={text}
                 onChange={(e) => {
                   ensureSession();
+
                   setAnalyzed(false);
                   setAnalysisSnapshot(null);
+
                   setText(e.target.value);
                 }}
                 onKeyDown={onKeyDown}
@@ -443,30 +873,46 @@ font-mono
                 aria-label="Text to analyze"
                 spellCheck={false}
               />
+
               {dragging && (
                 <div className="absolute inset-0 grid place-items-center bg-primary/10 rounded-xl backdrop-blur-sm text-sm font-medium">
                   Drop text file to append
                 </div>
               )}
             </div>
+
             <div className="mt-3 flex flex-wrap gap-2">
               <button
                 onClick={runAnalysis}
                 disabled={!text.trim()}
                 className="px-4 py-2 rounded-lg text-sm font-medium disabled:opacity-40 disabled:cursor-not-allowed transition"
                 style={{
-                  background: "linear-gradient(135deg, var(--color-primary), var(--color-accent))",
-                  color: "var(--color-primary-foreground)",
+                  background:
+                    "linear-gradient(135deg, var(--color-primary), var(--color-accent))",
+                  color:
+                    "var(--color-primary-foreground)",
                 }}
               >
                 Analyze
               </button>
+
               <button
                 onClick={reset}
                 className="px-3 py-2 rounded-lg text-sm glass hover:bg-primary/10 transition"
               >
                 Reset
               </button>
+
+              <button
+                onClick={copySummary}
+                disabled={!analyzed}
+                className="px-3 py-2 rounded-lg text-sm glass hover:bg-primary/10 transition disabled:opacity-40"
+              >
+                {copied
+                  ? "✓ Copied"
+                  : "Copy Summary"}
+              </button>
+
               <button
                 onClick={exportJson}
                 disabled={!analyzed}
@@ -474,6 +920,7 @@ font-mono
               >
                 Export JSON
               </button>
+
               <button
                 onClick={exportPdf}
                 disabled={!analyzed}
@@ -481,10 +928,18 @@ font-mono
               >
                 Export PDF
               </button>
+
               <div className="ml-auto text-xs text-muted-foreground self-center">
                 🔒 100% local — nothing leaves this browser
               </div>
             </div>
+
+            {hasInput && !analyzed && (
+              <div className="mt-3 text-[11px] text-muted-foreground">
+                Live metrics settle shortly after typing stops. Run Analyze
+                for the final report.
+              </div>
+            )}
           </div>
 
           {/* Score grid */}
@@ -494,37 +949,85 @@ font-mono
               value={displayed.stats.avgWpm.toFixed(0)}
               tone="info"
               hint={`Peak ${displayed.stats.peakWpm.toFixed(0)}`}
-              progress={Math.min(100, displayed.stats.avgWpm)}
+              progress={Math.min(
+                100,
+                displayed.stats.avgWpm,
+              )}
             />
+
             <ScoreCard
               label="HUMAN SCORE"
-              value={hasInput ? `${displayed.scores.human}%` : "—"}
+              value={
+                hasInput
+                  ? `${displayed.scores.human}%`
+                  : "—"
+              }
               tone="success"
-              progress={hasInput ? displayed.scores.human : 0}
+              progress={
+                hasInput
+                  ? displayed.scores.human
+                  : 0
+              }
             />
+
             <ScoreCard
               label="AI SCORE"
-              value={hasInput ? `${displayed.scores.ai}%` : "—"}
+              value={
+                hasInput
+                  ? `${displayed.scores.ai}%`
+                  : "—"
+              }
               tone="danger"
-              progress={hasInput ? displayed.scores.ai : 0}
+              progress={
+                hasInput
+                  ? displayed.scores.ai
+                  : 0
+              }
             />
+
             <ScoreCard
               label="PASTE RATIO"
-              value={hasInput ? `${displayed.scores.paste}%` : "—"}
+              value={
+                hasInput
+                  ? `${displayed.scores.paste}%`
+                  : "—"
+              }
               tone="warning"
-              progress={hasInput ? displayed.scores.paste : 0}
+              progress={
+                hasInput
+                  ? displayed.scores.paste
+                  : 0
+              }
             />
+
             <ScoreCard
               label="EDITING ACTIVITY"
-              value={hasInput ? `${displayed.scores.editing}%` : "—"}
+              value={
+                hasInput
+                  ? `${displayed.scores.editing}%`
+                  : "—"
+              }
               tone="accent"
-              progress={hasInput ? displayed.scores.editing : 0}
+              progress={
+                hasInput
+                  ? displayed.scores.editing
+                  : 0
+              }
             />
+
             <ScoreCard
               label="Confidence"
-              value={hasInput ? `${displayed.scores.confidence}%` : "—"}
+              value={
+                hasInput
+                  ? `${displayed.scores.confidence}%`
+                  : "—"
+              }
               tone="primary"
-              progress={hasInput ? displayed.scores.confidence : 0}
+              progress={
+                hasInput
+                  ? displayed.scores.confidence
+                  : 0
+              }
             />
           </div>
 
@@ -532,26 +1035,50 @@ font-mono
           <AnimatePresence>
             {analyzed && (
               <motion.div
-                initial={{ opacity: 0, y: 12 }}
-                animate={{ opacity: 1, y: 0 }}
-                exit={{ opacity: 0 }}
+                initial={{
+                  opacity: 0,
+                  y: 12,
+                }}
+                animate={{
+                  opacity: 1,
+                  y: 0,
+                }}
+                exit={{
+                  opacity: 0,
+                }}
                 className="glass-strong rounded-2xl p-5 flex items-center justify-between"
               >
                 <div>
                   <div className="text-xs uppercase tracking-wider text-muted-foreground">
                     Overall verdict
                   </div>
+
                   <div className="mt-1 text-2xl font-semibold gradient-text">
                     {displayed.scores.verdict}
                   </div>
+
                   <div className="text-xs text-muted-foreground mt-1">
-                    Suspicious behavior score {displayed.scores.suspicious}/100
+                    Suspicious behavior score{" "}
+                    {displayed.scores.suspicious}
+                    /100
                   </div>
                 </div>
+
                 <div className="hidden md:block text-right text-xs text-muted-foreground">
-                  <div>Keystrokes {displayed.stats.keystrokes}</div>
-                  <div>Edits {displayed.stats.edits}</div>
-                  <div>Pauses {displayed.stats.pauses}</div>
+                  <div>
+                    Keystrokes{" "}
+                    {displayed.stats.keystrokes}
+                  </div>
+
+                  <div>
+                    Edits{" "}
+                    {displayed.stats.edits}
+                  </div>
+
+                  <div>
+                    Pauses{" "}
+                    {displayed.stats.pauses}
+                  </div>
                 </div>
               </motion.div>
             )}
@@ -561,9 +1088,13 @@ font-mono
             <h3 className="text-sm font-semibold uppercase tracking-wider text-muted-foreground mb-3">
               Input rate (keys / paste chars per second)
             </h3>
+
             <TypingRateChart
               events={events}
-              sessionMs={Math.max(1000, displayed.stats.sessionMs)}
+              sessionMs={Math.max(
+                1000,
+                displayed.stats.sessionMs,
+              )}
             />
           </div>
 
@@ -571,7 +1102,10 @@ font-mono
             <h3 className="text-sm font-semibold uppercase tracking-wider text-muted-foreground mb-3">
               Content fingerprint
             </h3>
-            <ContentRadar content={displayed.content} />
+
+            <ContentRadar
+              content={displayed.content}
+            />
           </div>
         </section>
 
@@ -581,14 +1115,20 @@ font-mono
             <h3 className="text-sm font-semibold uppercase tracking-wider text-muted-foreground mb-4">
               ACTIVITY TIMELINE
             </h3>
-            <Timeline entries={displayed.timeline} />
+
+            <Timeline
+              entries={displayed.timeline}
+            />
           </div>
 
           <div className="glass rounded-2xl p-5">
             <h3 className="text-sm font-semibold uppercase tracking-wider text-muted-foreground mb-4">
               Why this verdict
             </h3>
-            <Explanations items={displayed.explanations} />
+
+            <Explanations
+              items={displayed.explanations}
+            />
           </div>
 
           <div className="glass rounded-2xl p-5">
@@ -596,6 +1136,7 @@ font-mono
               <h3 className="text-sm font-semibold uppercase tracking-wider text-muted-foreground">
                 Session history
               </h3>
+
               {history.length > 0 && (
                 <button
                   onClick={clearHistory}
@@ -605,6 +1146,7 @@ font-mono
                 </button>
               )}
             </div>
+
             {history.length === 0 ? (
               <div className="text-sm text-muted-foreground italic">
                 Run an analysis to save a session for comparison.
@@ -619,24 +1161,55 @@ font-mono
                         ? "border-primary/60 bg-primary/10"
                         : "border-border hover:bg-primary/10"
                     }`}
-                    onClick={() => setCompareId(compareId === h.id ? null : h.id)}
+                    onClick={() =>
+                      setCompareId(
+                        compareId === h.id
+                          ? null
+                          : h.id,
+                      )
+                    }
                     onKeyDown={(e) => {
-                      if (e.key === "Enter" || e.key === " ") {
+                      if (
+                        e.key === "Enter" ||
+                        e.key === " "
+                      ) {
                         e.preventDefault();
-                        setCompareId(compareId === h.id ? null : h.id);
+
+                        setCompareId(
+                          compareId === h.id
+                            ? null
+                            : h.id,
+                        );
                       }
                     }}
                     role="button"
                     tabIndex={0}
-                    aria-pressed={compareId === h.id}
+                    aria-pressed={
+                      compareId === h.id
+                    }
                   >
                     <div className="flex items-center justify-between text-xs text-muted-foreground">
-                      <span>{new Date(h.createdAt).toLocaleTimeString()}</span>
-                      <span className="gradient-text font-semibold">{h.scores.verdict}</span>
+                      <span>
+                        {new Date(
+                          h.createdAt,
+                        ).toLocaleTimeString()}
+                      </span>
+
+                      <span className="gradient-text font-semibold">
+                        {h.scores.verdict}
+                      </span>
                     </div>
-                    <div className="mt-1 text-sm truncate">{h.textPreview || <em>(empty)</em>}</div>
+
+                    <div className="mt-1 text-sm truncate">
+                      {h.textPreview || (
+                        <em>(empty)</em>
+                      )}
+                    </div>
+
                     <div className="mt-1 text-xs tabular-nums text-muted-foreground">
-                      H {h.scores.human}% · AI {h.scores.ai}% · Paste {h.scores.paste}%
+                      H {h.scores.human}% · AI{" "}
+                      {h.scores.ai}% · Paste{" "}
+                      {h.scores.paste}%
                     </div>
                   </li>
                 ))}
@@ -646,28 +1219,69 @@ font-mono
 
           {compareSession && (
             <motion.div
-              initial={{ opacity: 0, y: 8 }}
-              animate={{ opacity: 1, y: 0 }}
+              initial={{
+                opacity: 0,
+                y: 8,
+              }}
+              animate={{
+                opacity: 1,
+                y: 0,
+              }}
               className="glass-strong rounded-2xl p-5"
             >
               <h3 className="text-sm font-semibold uppercase tracking-wider text-muted-foreground mb-3">
                 Current vs. saved session
               </h3>
+
               <div className="grid grid-cols-3 gap-2 text-center text-xs">
                 <div />
-                <div className="text-muted-foreground">Current</div>
-                <div className="text-muted-foreground">Saved</div>
+
+                <div className="text-muted-foreground">
+                  Current
+                </div>
+
+                <div className="text-muted-foreground">
+                  Saved
+                </div>
+
                 {(
                   [
-                    ["Human", displayed.scores.human, compareSession.scores.human],
-                    ["AI", displayed.scores.ai, compareSession.scores.ai],
-                    ["Paste", displayed.scores.paste, compareSession.scores.paste],
-                    ["Editing", displayed.scores.editing, compareSession.scores.editing],
-                    ["Suspicious", displayed.scores.suspicious, compareSession.scores.suspicious],
+                    [
+                      "Human",
+                      displayed.scores.human,
+                      compareSession.scores.human,
+                    ],
+                    [
+                      "AI",
+                      displayed.scores.ai,
+                      compareSession.scores.ai,
+                    ],
+                    [
+                      "Paste",
+                      displayed.scores.paste,
+                      compareSession.scores.paste,
+                    ],
+                    [
+                      "Editing",
+                      displayed.scores.editing,
+                      compareSession.scores.editing,
+                    ],
+                    [
+                      "Suspicious",
+                      displayed.scores.suspicious,
+                      compareSession.scores.suspicious,
+                    ],
                   ] as const
-                ).map(([label, a, b]) => (
-                  <ComparisonRow key={label} label={label} a={a} b={b} />
-                ))}
+                ).map(
+                  ([label, a, b]) => (
+                    <ComparisonRow
+                      key={label}
+                      label={label}
+                      a={a}
+                      b={b}
+                    />
+                  ),
+                )}
               </div>
             </motion.div>
           )}
@@ -681,21 +1295,40 @@ font-mono
   );
 }
 
-function ComparisonRow({ label, a, b }: { label: string; a: number; b: number }) {
+function ComparisonRow({
+  label,
+  a,
+  b,
+}: {
+  label: string;
+  a: number;
+  b: number;
+}) {
   const diff = a - b;
+
   const tone =
     diff > 5
       ? "var(--color-success)"
       : diff < -5
         ? "var(--color-danger)"
         : "var(--color-muted-foreground)";
+
   return (
     <>
-      <div className="text-left text-muted-foreground py-1">{label}</div>
-      <div className="tabular-nums font-medium" style={{ color: tone }}>
+      <div className="text-left text-muted-foreground py-1">
+        {label}
+      </div>
+
+      <div
+        className="tabular-nums font-medium"
+        style={{ color: tone }}
+      >
         {a}%
       </div>
-      <div className="tabular-nums text-muted-foreground">{b}%</div>
+
+      <div className="tabular-nums text-muted-foreground">
+        {b}%
+      </div>
     </>
   );
 }
