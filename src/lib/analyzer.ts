@@ -52,7 +52,7 @@ export interface Scores {
   editing: number; // 0-100
   suspicious: number; // 0-100
   confidence: number; // 0-100
-  verdict: "Human" | "Likely Human" | "Mixed" | "Likely AI" | "AI / Pasted";
+  verdict: "Human" | "Likely Human" | "Mixed" | "Likely AI" | "AI / Pasted" | "Insufficient Data";
 }
 
 export interface ContentAnalysis {
@@ -97,23 +97,19 @@ const AI_PHRASES = [
 ];
 
 /** Compute rolling + summary stats from an event stream. */
-export function computeStats(
-  events: BehaviorEvent[],
-  text: string,
-  nowMs: number,
-): SessionStats {
+export function computeStats(events: BehaviorEvent[], text: string, nowMs: number): SessionStats {
   const words = text.trim().length ? text.trim().split(/\s+/).length : 0;
   const chars = text.length;
 
   const keydowns = events.filter((e) => e.type === "keydown");
   const backspaces = events.filter((e) => e.type === "backspace").length;
   const deletes = events.filter((e) => e.type === "delete").length;
-  const pastes = events.filter((e) => e.type === "paste");
+  const pastes = events.filter((e) => e.type === "paste" || e.type === "drop");
   const copies = events.filter((e) => e.type === "copy").length;
   const cursorMoves = events.filter((e) => e.type === "cursor").length;
   const selections = events.filter((e) => e.type === "selection").length;
 
-  const firstKey = events.find((e) => e.type === "keydown" || e.type === "paste");
+  const firstKey = keydowns[0];
   const timeToFirstKeystrokeMs = firstKey ? firstKey.t : null;
 
   // Keystroke intervals
@@ -123,21 +119,18 @@ export function computeStats(
   }
   const sortedIntervals = [...intervals].sort((a, b) => a - b);
   const medianInterval =
-    sortedIntervals.length > 0
-      ? sortedIntervals[Math.floor(sortedIntervals.length / 2)]
-      : 0;
+    sortedIntervals.length > 0 ? sortedIntervals[Math.floor(sortedIntervals.length / 2)] : 0;
 
   // Pauses (>1200ms gaps between keystrokes)
   const pauseGaps = intervals.filter((i) => i > 1200);
   const longestPause = pauseGaps.length ? Math.max(...pauseGaps) : 0;
-  const avgPause = pauseGaps.length
-    ? pauseGaps.reduce((a, b) => a + b, 0) / pauseGaps.length
-    : 0;
+  const avgPause = pauseGaps.length ? pauseGaps.reduce((a, b) => a + b, 0) / pauseGaps.length : 0;
 
   // WPM — rolling per 5s window peak
   const sessionMs = nowMs;
-  const writingMs = Math.max(1, sessionMs - (timeToFirstKeystrokeMs ?? 0));
-  const avgWpm = writingMs > 0 ? (words / (writingMs / 60000)) : 0;
+  const writingMs = keydowns.length ? Math.max(1, sessionMs - (timeToFirstKeystrokeMs ?? 0)) : 0;
+  const typedWords = keydowns.length / 5;
+  const avgWpm = writingMs > 0 ? typedWords / (writingMs / 60000) : 0;
 
   let peakWpm = 0;
   const windowMs = 5000;
@@ -148,14 +141,8 @@ export function computeStats(
     if (wpm > peakWpm) peakWpm = wpm;
   }
 
-  const pasteChars = pastes.reduce(
-    (sum, p) => sum + (Number(p.meta?.size) || 0),
-    0,
-  );
-  const largestPaste = pastes.reduce(
-    (m, p) => Math.max(m, Number(p.meta?.size) || 0),
-    0,
-  );
+  const pasteChars = pastes.reduce((sum, p) => sum + (Number(p.meta?.size) || 0), 0);
+  const largestPaste = pastes.reduce((m, p) => Math.max(m, Number(p.meta?.size) || 0), 0);
 
   return {
     totalChars: chars,
@@ -205,11 +192,9 @@ export function analyzeContent(text: string): ContentAnalysis {
   const vocabularyDiversity = words.length ? unique.size / words.length : 0;
 
   const sentenceLengths = sentences.map((s) => s.split(/\s+/).length);
-  const meanLen =
-    sentenceLengths.reduce((a, b) => a + b, 0) / (sentenceLengths.length || 1);
+  const meanLen = sentenceLengths.reduce((a, b) => a + b, 0) / (sentenceLengths.length || 1);
   const variance =
-    sentenceLengths.reduce((a, b) => a + (b - meanLen) ** 2, 0) /
-    (sentenceLengths.length || 1);
+    sentenceLengths.reduce((a, b) => a + (b - meanLen) ** 2, 0) / (sentenceLengths.length || 1);
   const stdev = Math.sqrt(variance);
   // Burstiness: higher stdev/mean = more human-like
   const burstiness = meanLen ? Math.min(1, stdev / meanLen) : 0;
@@ -223,15 +208,10 @@ export function analyzeContent(text: string): ContentAnalysis {
     bigrams.set(bg, (bigrams.get(bg) ?? 0) + 1);
   }
   const topBg = [...bigrams.values()].sort((a, b) => b - a).slice(0, 3);
-  const repetition = words.length
-    ? topBg.reduce((a, b) => a + b, 0) / words.length
-    : 0;
+  const repetition = words.length ? topBg.reduce((a, b) => a + b, 0) / words.length : 0;
 
   // Perplexity proxy: mix of diversity + sentence variance
-  const perplexity = Math.max(
-    5,
-    Math.min(120, 15 + vocabularyDiversity * 60 + stdev * 4),
-  );
+  const perplexity = Math.max(5, Math.min(120, 15 + vocabularyDiversity * 60 + stdev * 4));
 
   const lower = clean.toLowerCase();
   const aiPhraseHits = AI_PHRASES.filter((p) => lower.includes(p));
@@ -255,9 +235,7 @@ export function analyzeContent(text: string): ContentAnalysis {
 
   // Grammar consistency (heuristic): capital after period, no doubled spaces
   const properCaps = (clean.match(/[.!?]\s+[A-Z]/g) ?? []).length;
-  const grammarConsistency = sentences.length
-    ? Math.min(1, properCaps / sentences.length)
-    : 0.5;
+  const grammarConsistency = sentences.length ? Math.min(1, properCaps / sentences.length) : 0.5;
 
   return {
     grammarConsistency,
@@ -274,14 +252,9 @@ export function analyzeContent(text: string): ContentAnalysis {
 }
 
 /** Combine behavior + content into scores. */
-export function computeScores(
-  stats: SessionStats,
-  content: ContentAnalysis,
-): Scores {
+export function computeScores(stats: SessionStats, content: ContentAnalysis): Scores {
   // Paste probability
-  const pasteRatio = stats.totalChars
-    ? stats.pasteChars / stats.totalChars
-    : 0;
+  const pasteRatio = stats.totalChars ? Math.min(1, stats.pasteChars / stats.totalChars) : 0;
   const paste = Math.round(
     Math.min(
       100,
@@ -292,31 +265,30 @@ export function computeScores(
   );
 
   // Editing score — how much revision happened
-  const editRatio = stats.keystrokes
-    ? stats.edits / stats.keystrokes
-    : 0;
+  const editRatio = stats.keystrokes ? stats.edits / stats.keystrokes : 0;
   const editing = Math.round(Math.min(100, editRatio * 220));
 
   // AI probability: high paste, low burstiness, AI phrases, low diversity
   let ai = 0;
   ai += paste * 0.45;
-  ai += (1 - content.burstiness) * 25;
-  ai += content.aiPhraseHits.length * 6;
-  ai += (1 - content.vocabularyDiversity) * 20;
-  ai += content.predictability * 15;
-  if (stats.timeToFirstKeystrokeMs !== null && stats.timeToFirstKeystrokeMs < 200 && stats.pastes > 0) {
+  const enoughContentForStylometry = stats.totalWords >= 20;
+  if (enoughContentForStylometry) {
+    ai += (1 - content.burstiness) * 25;
+    ai += content.aiPhraseHits.length * 6;
+    ai += (1 - content.vocabularyDiversity) * 20;
+    ai += content.predictability * 15;
+  }
+  if (
+    stats.timeToFirstKeystrokeMs !== null &&
+    stats.timeToFirstKeystrokeMs < 200 &&
+    stats.pastes > 0
+  ) {
     ai += 10;
   }
   ai = Math.round(Math.max(0, Math.min(100, ai)));
 
-  // Human probability: opposite signals
-  let human = 0;
-  human += (1 - pasteRatio) * 35;
-  human += content.burstiness * 25;
-  human += content.vocabularyDiversity * 20;
-  human += editing > 5 ? Math.min(15, editing / 5) : 0;
-  human += stats.pauses > 0 ? 10 : 0;
-  human = Math.round(Math.max(0, Math.min(100, human)));
+  // Headline scores are opposing ends of one bounded heuristic.
+  const human = Math.round(Math.max(0, Math.min(100, 100 - ai)));
 
   // Suspicious behavior: very fast typing, no pauses, huge paste, zero edits with long text
   let suspicious = 0;
@@ -328,14 +300,18 @@ export function computeScores(
   suspicious = Math.min(100, suspicious);
 
   // Confidence in the verdict: how much data we have
-  const dataPoints =
-    stats.keystrokes + stats.pastes * 5 + Math.min(50, stats.totalWords);
-  const confidence = Math.round(Math.min(100, (dataPoints / 120) * 100));
+  const dataPoints = stats.keystrokes + stats.pastes * 5 + Math.min(50, stats.totalWords);
+  const hasMeaningfulText = stats.totalWords >= 5;
+  const hasBehaviorEvidence = stats.keystrokes >= 5 || stats.pastes > 0;
+  const confidence = Math.round(
+    Math.min(100, (dataPoints / 120) * 100) * (stats.pastes > 0 && stats.keystrokes < 5 ? 0.55 : 1),
+  );
 
   let verdict: Scores["verdict"];
-  if (ai >= 75) verdict = "AI / Pasted";
-  else if (ai >= 55) verdict = "Likely AI";
-  else if (ai >= 35) verdict = "Mixed";
+  if (!hasMeaningfulText || !hasBehaviorEvidence) verdict = "Insufficient Data";
+  else if (ai >= 75 && (paste >= 60 || stats.totalWords >= 30)) verdict = "AI / Pasted";
+  else if (ai >= 55 && (paste >= 40 || stats.totalWords >= 20)) verdict = "Likely AI";
+  else if (ai >= 35 && stats.totalWords >= 10) verdict = "Mixed";
   else if (human >= 55) verdict = "Likely Human";
   else verdict = "Human";
 
@@ -350,6 +326,17 @@ export function buildExplanations(
 ): Explanation[] {
   const out: Explanation[] = [];
 
+  if (scores.verdict === "Insufficient Data") {
+    out.push({
+      label: "Insufficient behavioral evidence",
+      reason: "This session is too short to support a reliable heuristic conclusion.",
+      evidence: `${stats.totalWords} words, ${stats.keystrokes} keystrokes, ${stats.pastes} paste/drop event(s).`,
+      confidence: scores.confidence,
+      behavior: "Low-data session",
+      risk: "low",
+    });
+  }
+
   if (scores.paste > 40) {
     out.push({
       label: "High paste ratio",
@@ -363,11 +350,12 @@ export function buildExplanations(
 
   if (content.aiPhraseHits.length > 0) {
     out.push({
-      label: "AI-style phrasing detected",
-      reason: "Text contains phrases commonly over-used by language models.",
+      label: "Heuristic phrase overlap",
+      reason:
+        "The text contains phrases included in this analyzer's overlap list; this is not evidence of authorship.",
       evidence: content.aiPhraseHits.slice(0, 5).join(", "),
       confidence: 60 + content.aiPhraseHits.length * 5,
-      behavior: "Stylometric fingerprint",
+      behavior: "Phrase overlap signal",
       risk: content.aiPhraseHits.length > 3 ? "high" : "medium",
     });
   }
@@ -375,8 +363,7 @@ export function buildExplanations(
   if (content.burstiness < 0.3 && stats.totalWords > 30) {
     out.push({
       label: "Low burstiness",
-      reason:
-        "Sentence lengths are unusually uniform — a common trait of generated text.",
+      reason: "Sentence lengths are unusually uniform — a common trait of generated text.",
       evidence: `Burstiness score ${(content.burstiness * 100).toFixed(0)}/100`,
       confidence: 70,
       behavior: "Uniform sentence rhythm",
@@ -386,8 +373,8 @@ export function buildExplanations(
 
   if (stats.peakWpm > 180) {
     out.push({
-      label: "Impossibly fast typing",
-      reason: "Peak WPM exceeds sustained human typing speed.",
+      label: "Very fast input burst",
+      reason: "The measured keydown burst is unusually fast for sustained typing.",
       evidence: `Peak ${stats.peakWpm.toFixed(0)} WPM`,
       confidence: 80,
       behavior: "Non-human input speed",
@@ -397,9 +384,9 @@ export function buildExplanations(
 
   if (stats.pauses === 0 && stats.totalWords > 40) {
     out.push({
-      label: "No natural pauses",
-      reason: "Humans usually pause to think while composing longer text.",
-      evidence: `0 pauses across ${stats.totalWords} words`,
+      label: "No long keydown gaps",
+      reason: "No keydown gap exceeded the analyzer's pause threshold during this session.",
+      evidence: `0 long gaps across ${stats.totalWords} words`,
       confidence: 55,
       behavior: "Continuous input stream",
       risk: "medium",
@@ -439,13 +426,13 @@ export interface TimelineEntry {
 
 export function buildTimeline(events: BehaviorEvent[]): TimelineEntry[] {
   const out: TimelineEntry[] = [];
-  const first = events.find((e) => e.type === "keydown" || e.type === "paste");
+  const first = events.find((e) => e.type === "keydown" || e.type === "paste" || e.type === "drop");
   if (first) out.push({ t: first.t, label: "Started typing", kind: "start" });
 
   // First pause
   const keys = events.filter((e) => e.type === "keydown");
   for (let i = 1; i < keys.length; i++) {
-    if (keys[i].t - keys[i - 1].t > 1500) {
+    if (keys[i].t - keys[i - 1].t > 1200) {
       out.push({
         t: keys[i - 1].t,
         label: `Pause (${((keys[i].t - keys[i - 1].t) / 1000).toFixed(1)}s)`,
@@ -457,19 +444,19 @@ export function buildTimeline(events: BehaviorEvent[]): TimelineEntry[] {
 
   // Large pastes
   events
-    .filter((e) => e.type === "paste" && Number(e.meta?.size) > 100)
+    .filter((e) => (e.type === "paste" || e.type === "drop") && Number(e.meta?.size) > 100)
     .forEach((p) => {
       out.push({
         t: p.t,
-        label: `Large paste (${p.meta?.size} chars)`,
+        label: `${p.type === "drop" ? "Dropped text" : "Large paste"} (${p.meta?.size} chars)`,
         kind: "paste",
       });
     });
 
   // Major edit bursts (>=5 backspaces within 2s)
   const bs = events.filter((e) => e.type === "backspace" || e.type === "delete");
-  for (let i = 0; i + 5 < bs.length; i++) {
-    if (bs[i + 5].t - bs[i].t < 2000) {
+  for (let i = 0; i + 4 < bs.length; i++) {
+    if (bs[i + 4].t - bs[i].t < 2000) {
       out.push({ t: bs[i].t, label: "Major edit burst", kind: "edit" });
       i += 5;
     }

@@ -23,9 +23,9 @@ export function Explanations({ items }: { items: Explanation[] }) {
             <span
               className="text-[10px] uppercase tracking-wider px-2 py-1 rounded-full"
               style={{
-                background: `${riskColor[e.risk]}22`,
+                background: `color-mix(in srgb, ${riskColor[e.risk]} 13%, transparent)`,
                 color: riskColor[e.risk],
-                border: `1px solid ${riskColor[e.risk]}55`,
+                border: `1px solid color-mix(in srgb, ${riskColor[e.risk]} 33%, transparent)`,
               }}
             >
               {e.risk} risk
@@ -36,7 +36,7 @@ export function Explanations({ items }: { items: Explanation[] }) {
             <span className="text-muted-foreground">Evidence: </span>
             <span className="font-mono">{e.evidence}</span>
           </div>
-          <div className="mt-2 flex items-center justify-between text-xs text-muted-foreground">
+          <div className="mt-2 flex flex-wrap items-center justify-between gap-x-3 gap-y-1 text-xs text-muted-foreground">
             <span>Behavior: {e.behavior}</span>
             <span>Confidence {Math.min(100, Math.round(e.confidence))}%</span>
           </div>

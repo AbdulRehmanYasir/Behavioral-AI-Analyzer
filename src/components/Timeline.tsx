@@ -18,10 +18,10 @@ export function Timeline({ entries }: { entries: TimelineEntry[] }) {
       </div>
     );
   }
-  const maxT = entries[entries.length - 1].t || 1;
+  const maxT = Math.max(1, ...entries.map((entry) => Math.max(0, entry.t)));
   return (
     <div className="relative">
-      <div className="absolute left-4 top-0 bottom-0 w-px bg-white/10" />
+      <div className="absolute left-4 top-0 bottom-0 w-px bg-border" />
       <ol className="space-y-4">
         {entries.map((e, i) => {
           const s = kindStyle[e.kind];
@@ -34,8 +34,13 @@ export function Timeline({ entries }: { entries: TimelineEntry[] }) {
               className="relative pl-12"
             >
               <span
+                aria-hidden="true"
                 className="absolute left-0 top-0 w-8 h-8 rounded-full grid place-items-center text-sm font-semibold"
-                style={{ background: `${s.color}22`, color: s.color, border: `1px solid ${s.color}55` }}
+                style={{
+                  background: `color-mix(in srgb, ${s.color} 13%, transparent)`,
+                  color: s.color,
+                  border: `1px solid color-mix(in srgb, ${s.color} 33%, transparent)`,
+                }}
               >
                 {s.icon}
               </span>
@@ -45,10 +50,13 @@ export function Timeline({ entries }: { entries: TimelineEntry[] }) {
                   {(e.t / 1000).toFixed(2)}s
                 </div>
               </div>
-              <div className="mt-1 h-1 rounded-full bg-white/5 overflow-hidden">
+              <div className="mt-1 h-1 rounded-full bg-muted overflow-hidden">
                 <div
                   className="h-full"
-                  style={{ width: `${(e.t / maxT) * 100}%`, background: s.color }}
+                  style={{
+                    width: `${Math.min(100, Math.max(0, (e.t / maxT) * 100))}%`,
+                    background: s.color,
+                  }}
                 />
               </div>
             </motion.li>

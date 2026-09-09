@@ -11,6 +11,7 @@ import {
   Tooltip,
   CartesianGrid,
 } from "recharts";
+import { useId } from "react";
 import type { BehaviorEvent, ContentAnalysis } from "@/lib/analyzer";
 
 export function ContentRadar({ content }: { content: ContentAnalysis }) {
@@ -25,8 +26,11 @@ export function ContentRadar({ content }: { content: ContentAnalysis }) {
   return (
     <ResponsiveContainer width="100%" height={260}>
       <RadarChart data={data} outerRadius="75%">
-        <PolarGrid stroke="rgba(255,255,255,0.12)" />
-        <PolarAngleAxis dataKey="k" tick={{ fill: "var(--color-muted-foreground)", fontSize: 11 }} />
+        <PolarGrid stroke="var(--color-border)" />
+        <PolarAngleAxis
+          dataKey="k"
+          tick={{ fill: "var(--color-muted-foreground)", fontSize: 11 }}
+        />
         <Radar
           dataKey="v"
           stroke="var(--color-primary)"
@@ -39,7 +43,14 @@ export function ContentRadar({ content }: { content: ContentAnalysis }) {
   );
 }
 
-export function TypingRateChart({ events, sessionMs }: { events: BehaviorEvent[]; sessionMs: number }) {
+export function TypingRateChart({
+  events,
+  sessionMs,
+}: {
+  events: BehaviorEvent[];
+  sessionMs: number;
+}) {
+  const chartId = useId().replace(/:/g, "");
   const bucket = 1000;
   const buckets = Math.max(1, Math.ceil(sessionMs / bucket));
   const data = Array.from({ length: buckets }, (_, i) => ({
@@ -50,23 +61,27 @@ export function TypingRateChart({ events, sessionMs }: { events: BehaviorEvent[]
   events.forEach((e) => {
     const b = Math.min(buckets - 1, Math.floor(e.t / bucket));
     if (e.type === "keydown") data[b].keys++;
-    if (e.type === "paste") data[b].pastes += Number(e.meta?.size) || 0;
+    if (e.type === "paste" || e.type === "drop") data[b].pastes += Number(e.meta?.size) || 0;
   });
   return (
     <ResponsiveContainer width="100%" height={220}>
       <AreaChart data={data} margin={{ left: -10, right: 10, top: 10, bottom: 0 }}>
         <defs>
-          <linearGradient id="gKeys" x1="0" y1="0" x2="0" y2="1">
+          <linearGradient id={`${chartId}-keys`} x1="0" y1="0" x2="0" y2="1">
             <stop offset="0%" stopColor="var(--color-primary)" stopOpacity={0.7} />
             <stop offset="100%" stopColor="var(--color-primary)" stopOpacity={0} />
           </linearGradient>
-          <linearGradient id="gPaste" x1="0" y1="0" x2="0" y2="1">
+          <linearGradient id={`${chartId}-paste`} x1="0" y1="0" x2="0" y2="1">
             <stop offset="0%" stopColor="var(--color-danger)" stopOpacity={0.7} />
             <stop offset="100%" stopColor="var(--color-danger)" stopOpacity={0} />
           </linearGradient>
         </defs>
-        <CartesianGrid stroke="rgba(255,255,255,0.06)" vertical={false} />
-        <XAxis dataKey="t" tick={{ fill: "var(--color-muted-foreground)", fontSize: 10 }} tickFormatter={(v) => `${v}s`} />
+        <CartesianGrid stroke="var(--color-border)" vertical={false} />
+        <XAxis
+          dataKey="t"
+          tick={{ fill: "var(--color-muted-foreground)", fontSize: 10 }}
+          tickFormatter={(v) => `${v}s`}
+        />
         <YAxis tick={{ fill: "var(--color-muted-foreground)", fontSize: 10 }} />
         <Tooltip
           contentStyle={{
@@ -76,8 +91,18 @@ export function TypingRateChart({ events, sessionMs }: { events: BehaviorEvent[]
             fontSize: 12,
           }}
         />
-        <Area type="monotone" dataKey="keys" stroke="var(--color-primary)" fill="url(#gKeys)" />
-        <Area type="monotone" dataKey="pastes" stroke="var(--color-danger)" fill="url(#gPaste)" />
+        <Area
+          type="monotone"
+          dataKey="keys"
+          stroke="var(--color-primary)"
+          fill={`url(#${chartId}-keys)`}
+        />
+        <Area
+          type="monotone"
+          dataKey="pastes"
+          stroke="var(--color-danger)"
+          fill={`url(#${chartId}-paste)`}
+        />
       </AreaChart>
     </ResponsiveContainer>
   );
